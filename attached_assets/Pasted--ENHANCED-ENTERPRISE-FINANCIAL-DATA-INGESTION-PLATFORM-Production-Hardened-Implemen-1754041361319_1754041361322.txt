@@ -1,0 +1,2085 @@
+// ===== ENHANCED ENTERPRISE FINANCIAL DATA INGESTION PLATFORM =====
+// Production-Hardened Implementation with Advanced Security, Caching, and Validation
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.cloud.context.config.annotation.RefreshScope;
+import org.springframework.vault.core.VaultTemplate;
+import org.springframework.vault.support.VaultResponse;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.transaction.annotation.Transactional;
+
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.retry.annotation.Retry;
+import io.github.resilience4j.bulkhead.annotation.Bulkhead;
+import io.micrometer.core.annotation.Timed;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Timer;
+
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import lombok.RequiredArgsConstructor;
+import lombok.Builder;
+
+import javax.persistence.*;
+import javax.validation.constraints.*;
+import javax.validation.Valid;
+import javax.validation.Validator;
+import javax.xml.XMLConstants;
+import javax.xml.validation.Schema;
+import javax.xml.validation.SchemaFactory;
+import javax.xml.validation.Validator as XmlValidator;
+import javax.xml.transform.stream.StreamSource;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.xml.XmlMapper;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.RemovalListener;
+import com.github.benmanes.caffeine.cache.stats.CacheStats;
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.time.LocalDateTime;
+import java.time.Duration;
+import java.math.BigDecimal;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.util.regex.Pattern;
+import java.io.InputStream;
+import java.io.StringReader;
+import javax.xml.stream.XMLStreamReader;
+import javax.xml.stream.XMLInputFactory;
+import javax.xml.stream.XMLStreamException;
+
+// ===== ENHANCED TENANT CONTEXT WITH SECURITY VALIDATION =====
+@Data
+@Builder
+public class SecureTenantContext implements AutoCloseable {
+    private String tenantId;
+    private String tenantName;
+    private Map<String, Object> tenantProperties;
+    private Set<String> allowedConnectors;
+    private SecurityProfile securityProfile;
+    private ResourceLimits resourceLimits;
+    private String sessionId;
+    private LocalDateTime createdAt;
+    private LocalDateTime lastAccessedAt;
+    private boolean validated;
+    
+    @Data
+    @Builder
+    public static class SecurityProfile {
+        private boolean requireMfa;
+        private Set<String> allowedIpRanges;
+        private Duration sessionTimeout;
+        private String encryptionLevel; // STANDARD, HIGH, FIPS
+        private Set<String> allowedDataFormats;
+        private BigDecimal maxTransactionAmount;
+    }
+    
+    @Data
+    @Builder
+    public static class ResourceLimits {
+        private int maxConcurrentConnections;
+        private int maxTransactionsPerMinute;
+        private long maxDataSizePerRequest;
+        private Duration maxProcessingTime;
+        private int maxCacheSize;
+    }
+    
+    @Override
+    public void close() {
+        // Cleanup resources when context is closed
+        if (tenantProperties != null) {
+            tenantProperties.clear();
+        }
+        if (allowedConnectors != null) {
+            allowedConnectors.clear();
+        }
+    }
+}
+
+@Component
+@Slf4j
+public class EnhancedTenantContextManager {
+    
+    private static final ThreadLocal<SecureTenantContext> TENANT_CONTEXT = new InheritableThreadLocal<>();
+    private final TenantValidator tenantValidator;
+    private final MeterRegistry meterRegistry;
+    private final AtomicLong activeContexts = new AtomicLong(0);
+    private final ScheduledExecutorService cleanupExecutor;
+    
+    // Patterns for tenant validation
+    private static final Pattern TENANT_ID_PATTERN = Pattern.compile("^[a-zA-Z0-9_-]{3,50}$");
+    private static final Pattern TENANT_NAME_PATTERN = Pattern.compile("^[a-zA-Z0-9\\s_-]{3,100}$");
+    
+    public EnhancedTenantContextManager(TenantValidator tenantValidator, MeterRegistry meterRegistry) {
+        this.tenantValidator = tenantValidator;
+        this.meterRegistry = meterRegistry;
+        this.cleanupExecutor = Executors.newScheduledThreadPool(2, r -> {
+            Thread t = new Thread(r, "tenant-context-cleanup");
+            t.setDaemon(true);
+            return t;
+        });
+        
+        // Schedule cleanup every 5 minutes
+        cleanupExecutor.scheduleAtFixedRate(this::cleanupExpiredContexts, 5, 5, TimeUnit.MINUTES);
+    }
+    
+    /**
+     * Sets tenant context with comprehensive validation and sanitization
+     */
+    public TenantContextHandle setTenantContext(SecureTenantContext context) throws TenantValidationException {
+        if (context == null) {
+            throw new TenantValidationException("TENANT_NULL", "Tenant context cannot be null", null);
+        }
+        
+        // Validate and sanitize tenant context
+        SecureTenantContext validatedContext = validateAndSanitizeTenantContext(context);
+        
+        // Check for existing context and clean up
+        SecureTenantContext existing = TENANT_CONTEXT.get();
+        if (existing != null) {
+            log.warn("Overriding existing tenant context for tenant: {}", existing.getTenantId());
+            existing.close();
+        }
+        
+        // Set new context
+        TENANT_CONTEXT.set(validatedContext);
+        activeContexts.incrementAndGet();
+        
+        Counter contextCounter = Counter.builder("tenant.context.created")
+            .tag("tenant", validatedContext.getTenantId())
+            .register(meterRegistry);
+        contextCounter.increment();
+        
+        log.debug("Set secure tenant context for tenant: {} with session: {}", 
+                 validatedContext.getTenantId(), validatedContext.getSessionId());
+        
+        return new TenantContextHandle(validatedContext);
+    }
+    
+    private SecureTenantContext validateAndSanitizeTenantContext(SecureTenantContext context) 
+            throws TenantValidationException {
+        
+        // Basic field validation
+        if (context.getTenantId() == null || !TENANT_ID_PATTERN.matcher(context.getTenantId()).matches()) {
+            throw new TenantValidationException("INVALID_TENANT_ID", 
+                "Tenant ID must be 3-50 characters, alphanumeric with dashes/underscores only", 
+                Map.of("tenantId", context.getTenantId()));
+        }
+        
+        if (context.getTenantName() == null || !TENANT_NAME_PATTERN.matcher(context.getTenantName()).matches()) {
+            throw new TenantValidationException("INVALID_TENANT_NAME", 
+                "Tenant name must be 3-100 characters, alphanumeric with spaces/dashes/underscores only", 
+                Map.of("tenantName", context.getTenantName()));
+        }
+        
+        // Validate with external tenant service
+        tenantValidator.validateTenant(context.getTenantId());
+        
+        // Sanitize tenant properties
+        Map<String, Object> sanitizedProperties = sanitizeTenantProperties(context.getTenantProperties());
+        
+        // Generate secure session ID
+        String sessionId = generateSecureSessionId();
+        
+        // Build validated context
+        return SecureTenantContext.builder()
+            .tenantId(context.getTenantId())
+            .tenantName(context.getTenantName())
+            .tenantProperties(sanitizedProperties)
+            .allowedConnectors(new HashSet<>(context.getAllowedConnectors()))
+            .securityProfile(context.getSecurityProfile())
+            .resourceLimits(context.getResourceLimits())
+            .sessionId(sessionId)
+            .createdAt(LocalDateTime.now())
+            .lastAccessedAt(LocalDateTime.now())
+            .validated(true)
+            .build();
+    }
+    
+    private Map<String, Object> sanitizeTenantProperties(Map<String, Object> properties) {
+        if (properties == null) return new HashMap<>();
+        
+        Map<String, Object> sanitized = new HashMap<>();
+        
+        for (Map.Entry<String, Object> entry : properties.entrySet()) {
+            String key = entry.getKey();
+            Object value = entry.getValue();
+            
+            // Validate key format
+            if (key != null && key.matches("^[a-zA-Z0-9_.-]{1,50}$")) {
+                // Sanitize value based on type
+                Object sanitizedValue = sanitizePropertyValue(value);
+                if (sanitizedValue != null) {
+                    sanitized.put(key, sanitizedValue);
+                }
+            } else {
+                log.warn("Skipping invalid property key: {}", key);
+            }
+        }
+        
+        return sanitized;
+    }
+    
+    private Object sanitizePropertyValue(Object value) {
+        if (value == null) return null;
+        
+        if (value instanceof String) {
+            String strValue = (String) value;
+            // Remove potentially dangerous characters and limit length
+            String sanitized = strValue.replaceAll("[<>\"'&]", "").trim();
+            return sanitized.length() > 500 ? sanitized.substring(0, 500) : sanitized;
+        } else if (value instanceof Number || value instanceof Boolean) {
+            return value;
+        } else if (value instanceof Collection) {
+            // Skip collections for security
+            log.warn("Skipping collection property value");
+            return null;
+        } else {
+            // Convert other types to string and sanitize
+            return sanitizePropertyValue(value.toString());
+        }
+    }
+    
+    private String generateSecureSessionId() {
+        SecureRandom random = new SecureRandom();
+        byte[] bytes = new byte[32];
+        random.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+    
+    public SecureTenantContext getTenantContext() {
+        SecureTenantContext context = TENANT_CONTEXT.get();
+        if (context != null) {
+            context.setLastAccessedAt(LocalDateTime.now());
+        }
+        return context;
+    }
+    
+    public String getCurrentTenantId() {
+        SecureTenantContext context = getTenantContext();
+        return context != null ? context.getTenantId() : "default";
+    }
+    
+    public void clearTenantContext() {
+        SecureTenantContext context = TENANT_CONTEXT.get();
+        if (context != null) {
+            context.close();
+            TENANT_CONTEXT.remove();
+            activeContexts.decrementAndGet();
+            
+            Counter clearCounter = Counter.builder("tenant.context.cleared")
+                .tag("tenant", context.getTenantId())
+                .register(meterRegistry);
+            clearCounter.increment();
+            
+            log.debug("Cleared tenant context for tenant: {}", context.getTenantId());
+        }
+    }
+    
+    private void cleanupExpiredContexts() {
+        // This runs periodically to detect and warn about potential ThreadLocal leaks
+        long active = activeContexts.get();
+        if (active > 1000) { // Threshold for potential leak detection
+            log.warn("High number of active tenant contexts detected: {}. Potential ThreadLocal leak.", active);
+            
+            Counter leakCounter = Counter.builder("tenant.context.potential_leak")
+                .register(meterRegistry);
+            leakCounter.increment();
+        }
+        
+        log.debug("Active tenant contexts: {}", active);
+    }
+    
+    @PreDestroy
+    public void shutdown() {
+        cleanupExecutor.shutdown();
+        try {
+            if (!cleanupExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+                cleanupExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            cleanupExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+    
+    /**
+     * Auto-closeable handle for tenant context management
+     */
+    public class TenantContextHandle implements AutoCloseable {
+        private final SecureTenantContext context;
+        private final String originalTenantId;
+        
+        public TenantContextHandle(SecureTenantContext context) {
+            this.context = context;
+            this.originalTenantId = context.getTenantId();
+        }
+        
+        @Override
+        public void close() {
+            SecureTenantContext current = TENANT_CONTEXT.get();
+            if (current != null && Objects.equals(current.getTenantId(), originalTenantId)) {
+                clearTenantContext();
+            }
+        }
+        
+        public SecureTenantContext getContext() {
+            return context;
+        }
+    }
+}
+
+@Component
+@Slf4j
+public class TenantValidator {
+    
+    private final Cache<String, Boolean> validationCache;
+    private final MeterRegistry meterRegistry;
+    
+    public TenantValidator(MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
+        this.validationCache = Caffeine.newBuilder()
+            .maximumSize(10000)
+            .expireAfterWrite(Duration.ofMinutes(15))
+            .recordStats()
+            .build();
+    }
+    
+    @CircuitBreaker(name = "tenantValidation", fallbackMethod = "fallbackValidateTenant")
+    @Retry(name = "tenantValidation")
+    public void validateTenant(String tenantId) throws TenantValidationException {
+        // Check cache first
+        Boolean cached = validationCache.getIfPresent(tenantId);
+        if (Boolean.TRUE.equals(cached)) {
+            return;
+        }
+        
+        try {
+            // Simulate external tenant validation service call
+            boolean isValid = performExternalTenantValidation(tenantId);
+            
+            if (!isValid) {
+                throw new TenantValidationException("TENANT_NOT_FOUND", 
+                    "Tenant not found or inactive", Map.of("tenantId", tenantId));
+            }
+            
+            // Cache successful validation
+            validationCache.put(tenantId, true);
+            
+            Counter validationCounter = Counter.builder("tenant.validation.success")
+                .tag("tenant", tenantId)
+                .register(meterRegistry);
+            validationCounter.increment();
+            
+        } catch (Exception e) {
+            Counter errorCounter = Counter.builder("tenant.validation.error")
+                .tag("tenant", tenantId)
+                .register(meterRegistry);
+            errorCounter.increment();
+            
+            throw new TenantValidationException("VALIDATION_ERROR", 
+                "Failed to validate tenant", Map.of("tenantId", tenantId), e);
+        }
+    }
+    
+    public void fallbackValidateTenant(String tenantId, Exception ex) throws TenantValidationException {
+        log.warn("Using fallback validation for tenant: {}", tenantId, ex);
+        
+        // Check if we have any cached result (even expired)
+        Boolean cached = validationCache.getIfPresent(tenantId);
+        if (cached != null) {
+            log.info("Using cached validation result for tenant: {}", tenantId);
+            return;
+        }
+        
+        // As last resort, allow if tenant ID follows pattern (configurable policy)
+        if (tenantId.startsWith("fallback_") || tenantId.equals("default")) {
+            log.warn("Allowing tenant {} due to fallback policy", tenantId);
+            return;
+        }
+        
+        throw new TenantValidationException("VALIDATION_UNAVAILABLE", 
+            "Tenant validation service unavailable and no cached result", 
+            Map.of("tenantId", tenantId), ex);
+    }
+    
+    private boolean performExternalTenantValidation(String tenantId) {
+        // Simulate external validation logic
+        // In real implementation, this would call tenant management service
+        try {
+            Thread.sleep(50); // Simulate network call
+            return !tenantId.equals("invalid_tenant");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+}
+
+// ===== ENHANCED SECURE CREDENTIAL MANAGER WITH ADVANCED CACHING =====
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class EnhancedSecureCredentialManager {
+    
+    private final VaultTemplate vaultTemplate;
+    private final MeterRegistry meterRegistry;
+    private final CredentialManagerConfig config;
+    
+    // Advanced cache with LRU eviction and comprehensive stats
+    private final Cache<String, CachedCredential> credentialCache;
+    private final ScheduledExecutorService refreshExecutor;
+    private final AtomicInteger cacheHits = new AtomicInteger(0);
+    private final AtomicInteger cacheMisses = new AtomicInteger(0);
+    
+    public EnhancedSecureCredentialManager(VaultTemplate vaultTemplate, 
+                                         MeterRegistry meterRegistry,
+                                         CredentialManagerConfig config) {
+        this.vaultTemplate = vaultTemplate;
+        this.meterRegistry = meterRegistry;
+        this.config = config;
+        this.refreshExecutor = Executors.newScheduledThreadPool(3, r -> {
+            Thread t = new Thread(r, "credential-refresh");
+            t.setDaemon(true);
+            return t;
+        });
+        
+        // Build advanced cache with comprehensive configuration
+        this.credentialCache = Caffeine.newBuilder()
+            .maximumSize(config.getMaxCacheSize())
+            .expireAfterWrite(Duration.ofMinutes(config.getCacheTtlMinutes()))
+            .refreshAfterWrite(Duration.ofMinutes(config.getRefreshBeforeExpiryMinutes()))
+            .recordStats()
+            .removalListener(new CredentialRemovalListener())
+            .build(this::loadCredentialFromVault);
+        
+        // Schedule proactive refresh
+        refreshExecutor.scheduleAtFixedRate(
+            this::proactiveRefresh, 
+            config.getProactiveRefreshIntervalMinutes(), 
+            config.getProactiveRefreshIntervalMinutes(), 
+            TimeUnit.MINUTES
+        );
+        
+        // Schedule cache statistics reporting
+        refreshExecutor.scheduleAtFixedRate(
+            this::reportCacheStatistics, 
+            1, 1, TimeUnit.MINUTES
+        );
+    }
+    
+    @CircuitBreaker(name = "vault", fallbackMethod = "fallbackGetCredential")
+    @Retry(name = "vault")
+    @Timed(value = "credential.retrieval")
+    public String getCredential(String path, String key) throws CredentialException {
+        String cacheKey = buildCacheKey(path, key);
+        
+        try {
+            CachedCredential credential = credentialCache.get(cacheKey);
+            
+            if (credential != null && !credential.isExpired()) {
+                cacheHits.incrementAndGet();
+                
+                // Update last accessed time
+                credential.updateLastAccessed();
+                
+                Counter hitCounter = Counter.builder("credential.cache.hit")
+                    .tag("path", sanitizePathForMetrics(path))
+                    .register(meterRegistry);
+                hitCounter.increment();
+                
+                log.debug("Retrieved credential from cache: {}/{}", path, key);
+                return credential.getValue();
+            } else {
+                cacheMisses.incrementAndGet();
+                
+                Counter missCounter = Counter.builder("credential.cache.miss")
+                    .tag("path", sanitizePathForMetrics(path))
+                    .register(meterRegistry);
+                missCounter.increment();
+                
+                // This will trigger cache loader
+                credential = credentialCache.get(cacheKey);
+                return credential != null ? credential.getValue() : null;
+            }
+            
+        } catch (Exception e) {
+            log.error("Failed to retrieve credential: {}/{}", path, key, e);
+            throw new CredentialException("CREDENTIAL_RETRIEVAL_FAILED", 
+                "Failed to retrieve credential", 
+                Map.of("path", path, "key", key), e);
+        }
+    }
+    
+    private CachedCredential loadCredentialFromVault(String cacheKey) {
+        String[] parts = cacheKey.split(":");
+        if (parts.length != 2) {
+            throw new CredentialException("INVALID_CACHE_KEY", 
+                "Invalid cache key format", Map.of("cacheKey", cacheKey));
+        }
+        
+        String path = parts[0];
+        String key = parts[1];
+        
+        try {
+            VaultResponse response = vaultTemplate.read(path);
+            if (response != null && response.getData() != null) {
+                String value = (String) response.getData().get(key);
+                if (value != null) {
+                    CredentialType credType = determineCredentialType(path, key);
+                    Duration ttl = getTtlForCredentialType(credType);
+                    
+                    CachedCredential credential = new CachedCredential(value, ttl, credType);
+                    
+                    Counter loadCounter = Counter.builder("credential.vault.load")
+                        .tag("path", sanitizePathForMetrics(path))
+                        .tag("type", credType.name())
+                        .register(meterRegistry);
+                    loadCounter.increment();
+                    
+                    log.debug("Loaded credential from Vault: {}/{}", path, key);
+                    return credential;
+                }
+            }
+        } catch (Exception e) {
+            log.error("Failed to load credential from Vault: {}/{}", path, key, e);
+            throw new CredentialException("VAULT_LOAD_FAILED", 
+                "Failed to load from Vault", Map.of("path", path, "key", key), e);
+        }
+        
+        throw new CredentialException("CREDENTIAL_NOT_FOUND", 
+            "Credential not found in Vault", Map.of("path", path, "key", key));
+    }
+    
+    public String fallbackGetCredential(String path, String key, Exception ex) throws CredentialException {
+        log.warn("Using fallback for credential {}/{} due to: {}", path, key, ex.getMessage());
+        
+        String cacheKey = buildCacheKey(path, key);
+        CachedCredential cached = credentialCache.getIfPresent(cacheKey);
+        
+        if (cached != null) {
+            FallbackPolicy policy = getFallbackPolicy(path, key);
+            
+            switch (policy) {
+                case ALLOW_EXPIRED:
+                    log.warn("Using expired credential for {}/{} as per fallback policy", path, key);
+                    Counter expiredCounter = Counter.builder("credential.fallback.expired")
+                        .tag("path", sanitizePathForMetrics(path))
+                        .register(meterRegistry);
+                    expiredCounter.increment();
+                    return cached.getValue();
+                    
+                case STRICT_EXPIRY:
+                    if (!cached.isExpired()) {
+                        return cached.getValue();
+                    }
+                    break;
+                    
+                case CONDITIONAL_EXPIRED:
+                    // Allow expired credentials for non-critical operations
+                    if (isNonCriticalCredential(path, key)) {
+                        log.warn("Using expired non-critical credential for {}/{}", path, key);
+                        return cached.getValue();
+                    }
+                    break;
+            }
+        }
+        
+        Counter fallbackFailureCounter = Counter.builder("credential.fallback.failure")
+            .tag("path", sanitizePathForMetrics(path))
+            .register(meterRegistry);
+        fallbackFailureCounter.increment();
+        
+        throw new CredentialException("FALLBACK_UNAVAILABLE", 
+            "No suitable fallback credential available", 
+            Map.of("path", path, "key", key), ex);
+    }
+    
+    private void proactiveRefresh() {
+        log.debug("Starting proactive credential refresh");
+        
+        credentialCache.asMap().entrySet().parallelStream()
+            .filter(entry -> entry.getValue().needsRefresh())
+            .forEach(entry -> {
+                try {
+                    String cacheKey = entry.getKey();
+                    credentialCache.refresh(cacheKey);
+                    
+                    Counter refreshCounter = Counter.builder("credential.proactive.refresh")
+                        .register(meterRegistry);
+                    refreshCounter.increment();
+                    
+                    log.debug("Proactively refreshed credential: {}", cacheKey);
+                } catch (Exception e) {
+                    log.error("Failed to proactively refresh credential: {}", entry.getKey(), e);
+                }
+            });
+    }
+    
+    private void reportCacheStatistics() {
+        CacheStats stats = credentialCache.stats();
+        
+        // Report cache metrics
+        meterRegistry.gauge("credential.cache.size", credentialCache.estimatedSize());
+        meterRegistry.gauge("credential.cache.hit_rate", stats.hitRate());
+        meterRegistry.gauge("credential.cache.miss_rate", stats.missRate());
+        meterRegistry.gauge("credential.cache.eviction_count", stats.evictionCount());
+        meterRegistry.gauge("credential.cache.load_average_time", stats.averageLoadTime());
+        
+        log.debug("Cache stats - Size: {}, Hit Rate: {:.2f}%, Evictions: {}", 
+                 credentialCache.estimatedSize(), 
+                 stats.hitRate() * 100, 
+                 stats.evictionCount());
+    }
+    
+    private String buildCacheKey(String path, String key) {
+        return path + ":" + key;
+    }
+    
+    private String sanitizePathForMetrics(String path) {
+        // Remove sensitive parts of path for metrics
+        return path.replaceAll("/[a-f0-9-]{36}/", "/xxx/"); // Remove UUIDs
+    }
+    
+    private CredentialType determineCredentialType(String path, String key) {
+        if (path.contains("database")) return CredentialType.DATABASE;
+        if (path.contains("api")) return CredentialType.API_KEY;
+        if (path.contains("oauth")) return CredentialType.OAUTH_TOKEN;
+        if (path.contains("certificate")) return CredentialType.CERTIFICATE;
+        return CredentialType.GENERIC;
+    }
+    
+    private Duration getTtlForCredentialType(CredentialType type) {
+        switch (type) {
+            case OAUTH_TOKEN: return Duration.ofMinutes(55); // OAuth tokens typically 1 hour
+            case API_KEY: return Duration.ofHours(24);
+            case DATABASE: return Duration.ofHours(12);
+            case CERTIFICATE: return Duration.ofDays(30);
+            default: return Duration.ofHours(6);
+        }
+    }
+    
+    private FallbackPolicy getFallbackPolicy(String path, String key) {
+        // Configure fallback policies based on credential importance
+        if (path.contains("critical") || key.contains("production")) {
+            return FallbackPolicy.STRICT_EXPIRY;
+        }
+        if (path.contains("monitoring") || key.contains("metrics")) {
+            return FallbackPolicy.ALLOW_EXPIRED;
+        }
+        return FallbackPolicy.CONDITIONAL_EXPIRED;
+    }
+    
+    private boolean isNonCriticalCredential(String path, String key) {
+        return path.contains("monitoring") || 
+               path.contains("metrics") || 
+               key.contains("readonly");
+    }
+    
+    @PreDestroy
+    public void shutdown() {
+        log.info("Shutting down credential manager");
+        
+        refreshExecutor.shutdown();
+        try {
+            if (!refreshExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+                refreshExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            refreshExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        
+        // Clear cache
+        credentialCache.invalidateAll();
+    }
+    
+    // Inner classes and enums
+    private enum CredentialType {
+        API_KEY, OAUTH_TOKEN, DATABASE, CERTIFICATE, GENERIC
+    }
+    
+    private enum FallbackPolicy {
+        STRICT_EXPIRY, ALLOW_EXPIRED, CONDITIONAL_EXPIRED
+    }
+    
+    private class CredentialRemovalListener implements RemovalListener<String, CachedCredential> {
+        @Override
+        public void onRemoval(String key, CachedCredential value, 
+                             com.github.benmanes.caffeine.cache.RemovalCause cause) {
+            Counter removalCounter = Counter.builder("credential.cache.removal")
+                .tag("cause", cause.name())
+                .register(meterRegistry);
+            removalCounter.increment();
+            
+            log.debug("Credential removed from cache: {} (cause: {})", key, cause);
+            
+            // Secure cleanup
+            if (value != null) {
+                value.secureDestroy();
+            }
+        }
+    }
+    
+    @Data
+    private static class CachedCredential {
+        private final String value;
+        private final LocalDateTime expiryTime;
+        private final LocalDateTime refreshTime;
+        private final CredentialType type;
+        private volatile LocalDateTime lastAccessed;
+        private volatile boolean destroyed = false;
+        
+        public CachedCredential(String value, Duration ttl, CredentialType type) {
+            this.value = value;
+            this.type = type;
+            this.lastAccessed = LocalDateTime.now();
+            this.expiryTime = LocalDateTime.now().plus(ttl);
+            // Refresh 10 minutes before expiry
+            this.refreshTime = expiryTime.minus(Duration.ofMinutes(10));
+        }
+        
+        public boolean isExpired() {
+            return destroyed || LocalDateTime.now().isAfter(expiryTime);
+        }
+        
+        public boolean needsRefresh() {
+            return !destroyed && LocalDateTime.now().isAfter(refreshTime);
+        }
+        
+        public void updateLastAccessed() {
+            this.lastAccessed = LocalDateTime.now();
+        }
+        
+        public void secureDestroy() {
+            // In a real implementation, you might want to overwrite sensitive data
+            destroyed = true;
+        }
+        
+        public String getValue() {
+            if (destroyed) {
+                throw new IllegalStateException("Credential has been destroyed");
+            }
+            return value;
+        }
+    }
+}
+
+@Data
+@ConfigurationProperties(prefix = "credential-manager")
+public class CredentialManagerConfig {
+    private int maxCacheSize = 10000;
+    private int cacheTtlMinutes = 30;
+    private int refreshBeforeExpiryMinutes = 10;
+    private int proactiveRefreshIntervalMinutes = 5;
+}
+
+// ===== ENHANCED ISO 20022 PARSER WITH SCHEMA VALIDATION =====
+@Component
+@Slf4j
+public class EnhancedISO20022Parser {
+    
+    private final XmlMapper xmlMapper;
+    private final Map<String, ISO20022MessageType> messageTypeRegistry;
+    private final Map<String, Schema> schemaCache;
+    private final XMLInputFactory xmlInputFactory;
+    private final MeterRegistry meterRegistry;
+    private final Validator beanValidator;
+    
+    // Performance metrics
+    private final Timer parseTimer;
+    private final Counter parseSuccessCounter;
+    private final Counter parseErrorCounter;
+    private final Counter schemaValidationCounter;
+    
+    public EnhancedISO20022Parser(MeterRegistry meterRegistry, Validator beanValidator) {
+        this.meterRegistry = meterRegistry;
+        this.beanValidator = beanValidator;
+        this.xmlMapper = new XmlMapper();
+        this.messageTypeRegistry = initializeMessageTypes();
+        this.schemaCache = new ConcurrentHashMap<>();
+        
+        // Configure XML input factory for security
+        this.xmlInputFactory = XMLInputFactory.newInstance();
+        configureXmlInputFactoryForSecurity();
+        
+        // Initialize metrics
+        this.parseTimer = Timer.builder("iso20022.parse.duration")
+            .description("Time taken to parse ISO 20022 messages")
+            .register(meterRegistry);
+        
+        this.parseSuccessCounter = Counter.builder("iso20022.parse.success")
+            .description("Successful ISO 20022 parse operations")
+            .register(meterRegistry);
+            
+        this.parseErrorCounter = Counter.builder("iso20022.parse.error")
+            .description("Failed ISO 20022 parse operations")
+            .register(meterRegistry);
+            
+        this.schemaValidationCounter = Counter.builder("iso20022.schema.validation")
+            .description("Schema validation operations")
+            .register(meterRegistry);
+    }
+    
+    @Timed(value = "iso20022.parse", description = "Parse ISO 20022 message")
+    public ISO20022ParseResult parse(String xmlContent) throws ISO20022ParseException {
+        if (xmlContent == null || xmlContent.trim().isEmpty()) {
+            throw new ISO20022ParseException("EMPTY_CONTENT", 
+                "XML content cannot be null or empty", null);
+        }
+        
+        Timer.Sample sample = parseTimer.start();
+        
+        try {
+            // Pre-validation and sanitization
+            String sanitizedXml = sanitizeXmlContent(xmlContent);
+            
+            // Extract message type safely
+            String messageType = extractMessageTypeSafely(sanitizedXml);
+            
+            // Get message type configuration
+            ISO20022MessageType typeConfig = messageTypeRegistry.get(messageType);
+            if (typeConfig == null) {
+                throw new ISO20022ParseException("UNSUPPORTED_MESSAGE_TYPE", 
+                    "Unsupported ISO 20022 message type", 
+                    Map.of("messageType", messageType));
+            }
+            
+            // Schema validation if available
+            if (typeConfig.isSchemaValidationEnabled()) {
+                validateAgainstSchema(sanitizedXml, messageType);
+            }
+            
+            // Parse message content
+            Map<String, Object> parsedData = parseMessageContent(sanitizedXml, messageType);
+            
+            // Validate parsed data
+            validateParsedData(parsedData, messageType);
+            
+            ISO20022ParseResult result = ISO20022ParseResult.builder()
+                .messageType(messageType)
+                .parsedFields(parsedData)
+                .valid(true)
+                .schemaValidated(typeConfig.isSchemaValidationEnabled())
+                .processingTimeMs(System.currentTimeMillis() - sample.start(TimeUnit.MILLISECONDS))
+                .build();
+            
+            parseSuccessCounter.increment(Tags.of("messageType", messageType));
+            
+            log.debug("Successfully parsed ISO 20022 message: {}", messageType);
+            return result;
+            
+        } catch (ISO20022ParseException e) {
+            parseErrorCounter.increment(Tags.of("error", e.getErrorCode()));
+            throw e;
+        } catch (Exception e) {
+            parseErrorCounter.increment(Tags.of("error", "UNEXPECTED"));
+            log.error("Unexpected error parsing ISO 20022 message", e);
+            throw new ISO20022ParseException("PARSE_ERROR", 
+                "Unexpected parsing error", null, e);
+        } finally {
+            sample.stop();
+        }
+    }
+    
+    /**
+     * Parse large messages using streaming to avoid memory issues
+     */
+    @Timed(value = "iso20022.stream.parse")
+    public ISO20022ParseResult parseStream(InputStream inputStream) throws ISO20022ParseException {
+        try {
+            XMLStreamReader reader = xmlInputFactory.createXMLStreamReader(inputStream);
+            
+            Map<String, Object> parsedData = new HashMap<>();
+            String messageType = null;
+            String currentElement = null;
+            StringBuilder textContent = new StringBuilder();
+            
+            while (reader.hasNext()) {
+                int event = reader.next();
+                
+                switch (event) {
+                    case XMLStreamReader.START_ELEMENT:
+                        currentElement = reader.getLocalName();
+                        
+                        // Extract message type from root element
+                        if (messageType == null && "Document".equals(currentElement)) {
+                            String namespace = reader.getNamespaceURI();
+                            messageType = extractMessageTypeFromNamespace(namespace);
+                        }
+                        
+                        textContent.setLength(0);
+                        break;
+                        
+                    case XMLStreamReader.CHARACTERS:
+                        textContent.append(reader.getText());
+                        break;
+                        
+                    case XMLStreamReader.END_ELEMENT:
+                        if (currentElement != null && textContent.length() > 0) {
+                            String content = textContent.toString().trim();
+                            if (!content.isEmpty()) {
+                                parsedData.put(currentElement, content);
+                            }
+                        }
+                        break;
+                }
+            }
+            
+            reader.close();
+            
+            return ISO20022ParseResult.builder()
+                .messageType(messageType)
+                .parsedFields(parsedData)
+                .valid(true)
+                .streamParsed(true)
+                .build();
+                
+        } catch (XMLStreamException e) {
+            throw new ISO20022ParseException("STREAM_PARSE_ERROR", 
+                "Failed to parse XML stream", null, e);
+        }
+    }
+    
+    private void configureXmlInputFactoryForSecurity() {
+        // Prevent XXE attacks
+        xmlInputFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, "");
+        xmlInputFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
+        xmlInputFactory.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
+        xmlInputFactory.setProperty(XMLInputFactory.SUPPORT_DTD, false);
+    }
+    
+    private String sanitizeXmlContent(String xmlContent) {
+        // Remove potential security threats while preserving valid XML
+        String sanitized = xmlContent
+            .replaceAll("<!DOCTYPE[^>]*>", "") // Remove DOCTYPE declarations
+            .replaceAll("<!\\[CDATA\\[.*?\\]\\]>", "") // Remove CDATA sections for security
+            .trim();
+        
+        // Basic XML well-formedness check
+        if (!sanitized.startsWith("<") || !sanitized.endsWith(">")) {
+            throw new ISO20022ParseException("MALFORMED_XML", 
+                "XML content appears to be malformed", null);
+        }
+        
+        return sanitized;
+    }
+    
+    private String extractMessageTypeSafely(String xmlContent) throws ISO20022ParseException {
+        try {
+            // Use regex to safely extract namespace without full parsing
+            Pattern namespacePattern = Pattern.compile(
+                "<Document[^>]*xmlns=\"urn:iso:std:iso:20022:tech:xsd:([^\"]+)\""
+            );
+            java.util.regex.Matcher matcher = namespacePattern.matcher(xmlContent);
+            
+            if (matcher.find()) {
+                return matcher.group(1);
+            }
+            
+            // Fallback: try to extract from root element name
+            Pattern rootPattern = Pattern.compile("<(\\w+)[^>]*>");
+            matcher = rootPattern.matcher(xmlContent);
+            if (matcher.find()) {
+                return mapRootElementToMessageType(matcher.group(1));
+            }
+            
+            throw new ISO20022ParseException("MESSAGE_TYPE_EXTRACTION_FAILED", 
+                "Could not extract message type from XML", null);
+                
+        } catch (Exception e) {
+            throw new ISO20022ParseException("MESSAGE_TYPE_EXTRACTION_ERROR", 
+                "Error extracting message type", null, e);
+        }
+    }
+    
+    private void validateAgainstSchema(String xmlContent, String messageType) 
+            throws ISO20022ParseException {
+        
+        try {
+            Schema schema = getSchemaForMessageType(messageType);
+            if (schema == null) {
+                log.warn("No schema available for message type: {}", messageType);
+                return;
+            }
+            
+            XmlValidator validator = schema.newValidator();
+            validator.validate(new StreamSource(new StringReader(xmlContent)));
+            
+            schemaValidationCounter.increment(Tags.of("messageType", messageType, "result", "success"));
+            
+            log.debug("Schema validation successful for message type: {}", messageType);
+            
+        } catch (Exception e) {
+            schemaValidationCounter.increment(Tags.of("messageType", messageType, "result", "failure"));
+            
+            throw new ISO20022ParseException("SCHEMA_VALIDATION_FAILED", 
+                "Message does not conform to ISO 20022 schema", 
+                Map.of("messageType", messageType, "validationError", e.getMessage()), e);
+        }
+    }
+    
+    private Schema getSchemaForMessageType(String messageType) {
+        return schemaCache.computeIfAbsent(messageType, this::loadSchemaForMessageType);
+    }
+    
+    private Schema loadSchemaForMessageType(String messageType) {
+        try {
+            String schemaPath = "/schemas/iso20022/" + messageType + ".xsd";
+            InputStream schemaStream = getClass().getResourceAsStream(schemaPath);
+            
+            if (schemaStream == null) {
+                log.warn("Schema not found for message type: {}", messageType);
+                return null;
+            }
+            
+            SchemaFactory factory = SchemaFactory.newInstance(XMLConstants.W3C_XML_SCHEMA_NS_URI);
+            
+            // Security: disable external entity processing
+            factory.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, "");
+            factory.setProperty(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
+            
+            Schema schema = factory.newSchema(new StreamSource(schemaStream));
+            
+            log.info("Loaded schema for message type: {}", messageType);
+            return schema;
+            
+        } catch (Exception e) {
+            log.error("Failed to load schema for message type: {}", messageType, e);
+            return null;
+        }
+    }
+    
+    private Map<String, Object> parseMessageContent(String xmlContent, String messageType) 
+            throws ISO20022ParseException {
+        
+        try {
+            Map<String, Object> document = xmlMapper.readValue(xmlContent, Map.class);
+            Map<String, Object> parsedData = new HashMap<>();
+            
+            switch (messageType) {
+                case "pain.001.001.03":
+                case "pain.001.001.09":
+                    parsePainMessage(document, parsedData);
+                    break;
+                case "pacs.008.001.02":
+                case "pacs.008.001.08":
+                    parsePacsMessage(document, parsedData);
+                    break;
+                case "camt.053.001.02":
+                case "camt.053.001.08":
+                    parseCamtMessage(document, parsedData);
+                    break;
+                default:
+                    parseGenericMessage(document, parsedData);
+            }
+            
+            return parsedData;
+            
+        } catch (Exception e) {
+            throw new ISO20022ParseException("CONTENT_PARSE_ERROR", 
+                "Failed to parse message content", 
+                Map.of("messageType", messageType), e);
+        }
+    }
+    
+    private void validateParsedData(Map<String, Object> parsedData, String messageType) 
+            throws ISO20022ParseException {
+        
+        // Basic validation
+        if (parsedData.isEmpty()) {
+            throw new ISO20022ParseException("EMPTY_PARSED_DATA", 
+                "No data was parsed from the message", 
+                Map.of("messageType", messageType));
+        }
+        
+        // Message-specific validation
+        switch (messageType) {
+            case "pain.001.001.03":
+            case "pain.001.001.09":
+                validatePainMessage(parsedData);
+                break;
+            case "pacs.008.001.02":
+            case "pacs.008.001.08":
+                validatePacsMessage(parsedData);
+                break;
+            case "camt.053.001.02":
+            case "camt.053.001.08":
+                validateCamtMessage(parsedData);
+                break;
+        }
+    }
+    
+    private void validatePainMessage(Map<String, Object> data) throws ISO20022ParseException {
+        List<String> errors = new ArrayList<>();
+        
+        if (!data.containsKey("messageId") || 
+            data.get("messageId").toString().trim().isEmpty()) {
+            errors.add("Message ID is required");
+        }
+        
+        if (!data.containsKey("numberOfTransactions")) {
+            errors.add("Number of transactions is required");
+        }
+        
+        if (!errors.isEmpty()) {
+            throw new ISO20022ParseException("PAIN_VALIDATION_FAILED", 
+                "Pain message validation failed", 
+                Map.of("errors", errors));
+        }
+    }
+    
+    private void validatePacsMessage(Map<String, Object> data) throws ISO20022ParseException {
+        List<String> errors = new ArrayList<>();
+        
+        if (!data.containsKey("messageId")) {
+            errors.add("Message ID is required");
+        }
+        
+        if (!data.containsKey("transactions") || 
+            !(data.get("transactions") instanceof List) ||
+            ((List<?>) data.get("transactions")).isEmpty()) {
+            errors.add("At least one transaction is required");
+        }
+        
+        if (!errors.isEmpty()) {
+            throw new ISO20022ParseException("PACS_VALIDATION_FAILED", 
+                "Pacs message validation failed", 
+                Map.of("errors", errors));
+        }
+    }
+    
+    private void validateCamtMessage(Map<String, Object> data) throws ISO20022ParseException {
+        List<String> errors = new ArrayList<>();
+        
+        if (!data.containsKey("statementId")) {
+            errors.add("Statement ID is required");
+        }
+        
+        if (!data.containsKey("account")) {
+            errors.add("Account information is required");
+        }
+        
+        if (!errors.isEmpty()) {
+            throw new ISO20022ParseException("CAMT_VALIDATION_FAILED", 
+                "Camt message validation failed", 
+                Map.of("errors", errors));
+        }
+    }
+    
+    // Safe type-checked extraction methods
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> safeGetMap(Map<String, Object> source, String key) {
+        Object value = source.get(key);
+        if (value instanceof Map) {
+            return (Map<String, Object>) value;
+        }
+        return null;
+    }
+    
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> safeGetList(Map<String, Object> source, String key) {
+        Object value = source.get(key);
+        if (value instanceof List) {
+            List<?> list = (List<?>) value;
+            // Validate all elements are Maps
+            if (list.stream().allMatch(item -> item instanceof Map)) {
+                return (List<Map<String, Object>>) value;
+            }
+        }
+        return new ArrayList<>();
+    }
+    
+    private String safeGetString(Map<String, Object> source, String key) {
+        Object value = source.get(key);
+        return value != null ? value.toString() : null;
+    }
+    
+    // Message parsing implementations with robust type checking
+    private void parsePainMessage(Map<String, Object> document, Map<String, Object> result) {
+        Map<String, Object> painDocument = safeGetMap(document, "Document");
+        if (painDocument == null) return;
+        
+        Map<String, Object> customerCreditTransfer = safeGetMap(painDocument, "CstmrCdtTrfInitn");
+        if (customerCreditTransfer == null) return;
+        
+        // Parse Group Header with type safety
+        Map<String, Object> groupHeader = safeGetMap(customerCreditTransfer, "GrpHdr");
+        if (groupHeader != null) {
+            result.put("messageId", safeGetString(groupHeader, "MsgId"));
+            result.put("creationDateTime", safeGetString(groupHeader, "CreDtTm"));
+            result.put("numberOfTransactions", safeGetString(groupHeader, "NbOfTxs"));
+            result.put("controlSum", safeGetString(groupHeader, "CtrlSum"));
+            
+            Map<String, Object> initiatingParty = safeGetMap(groupHeader, "InitgPty");
+            if (initiatingParty != null) {
+                result.put("initiatingPartyName", safeGetString(initiatingParty, "Nm"));
+            }
+        }
+        
+        // Parse Payment Information
+        Object paymentInfoObj = customerCreditTransfer.get("PmtInf");
+        if (paymentInfoObj != null) {
+            List<Map<String, Object>> payments = new ArrayList<>();
+            
+            if (paymentInfoObj instanceof List) {
+                List<Map<String, Object>> paymentList = safeGetList(customerCreditTransfer, "PmtInf");
+                for (Map<String, Object> payment : paymentList) {
+                    payments.add(parsePaymentInstruction(payment));
+                }
+            } else if (paymentInfoObj instanceof Map) {
+                payments.add(parsePaymentInstruction(safeGetMap(customerCreditTransfer, "PmtInf")));
+            }
+            
+            result.put("payments", payments);
+        }
+    }
+    
+    private void parsePacsMessage(Map<String, Object> document, Map<String, Object> result) {
+        Map<String, Object> pacsDocument = safeGetMap(document, "Document");
+        if (pacsDocument == null) return;
+        
+        Map<String, Object> fiToFiTransfer = safeGetMap(pacsDocument, "FIToFICstmrCdtTrf");
+        if (fiToFiTransfer == null) return;
+        
+        // Parse Group Header
+        Map<String, Object> groupHeader = safeGetMap(fiToFiTransfer, "GrpHdr");
+        if (groupHeader != null) {
+            result.put("messageId", safeGetString(groupHeader, "MsgId"));
+            result.put("creationDateTime", safeGetString(groupHeader, "CreDtTm"));
+            result.put("numberOfTransactions", safeGetString(groupHeader, "NbOfTxs"));
+        }
+        
+        // Parse Credit Transfer Transaction Information
+        Object transactionInfoObj = fiToFiTransfer.get("CdtTrfTxInf");
+        if (transactionInfoObj != null) {
+            List<Map<String, Object>> transactions = new ArrayList<>();
+            
+            if (transactionInfoObj instanceof List) {
+                List<Map<String, Object>> txList = safeGetList(fiToFiTransfer, "CdtTrfTxInf");
+                for (Map<String, Object> tx : txList) {
+                    transactions.add(parseCreditTransferTransaction(tx));
+                }
+            } else if (transactionInfoObj instanceof Map) {
+                transactions.add(parseCreditTransferTransaction(safeGetMap(fiToFiTransfer, "CdtTrfTxInf")));
+            }
+            
+            result.put("transactions", transactions);
+        }
+    }
+    
+    private void parseCamtMessage(Map<String, Object> document, Map<String, Object> result) {
+        Map<String, Object> camtDocument = safeGetMap(document, "Document");
+        if (camtDocument == null) return;
+        
+        Map<String, Object> bankStatement = safeGetMap(camtDocument, "BkToCstmrStmt");
+        if (bankStatement == null) return;
+        
+        // Parse Group Header
+        Map<String, Object> groupHeader = safeGetMap(bankStatement, "GrpHdr");
+        if (groupHeader != null) {
+            result.put("messageId", safeGetString(groupHeader, "MsgId"));
+            result.put("creationDateTime", safeGetString(groupHeader, "CreDtTm"));
+        }
+        
+        // Parse Statement
+        Map<String, Object> statement = safeGetMap(bankStatement, "Stmt");
+        if (statement != null) {
+            result.put("statementId", safeGetString(statement, "Id"));
+            
+            Map<String, Object> account = safeGetMap(statement, "Acct");
+            if (account != null) {
+                result.put("account", parseAccountInfo(account));
+            }
+            
+            // Parse balances
+            Object balanceObj = statement.get("Bal");
+            if (balanceObj != null) {
+                result.put("balances", parseBalances(balanceObj));
+            }
+            
+            // Parse entries
+            Object entriesObj = statement.get("Ntry");
+            if (entriesObj != null) {
+                result.put("entries", parseStatementEntries(entriesObj));
+            }
+        }
+    }
+    
+    private void parseGenericMessage(Map<String, Object> document, Map<String, Object> result) {
+        // Safely copy all data for unsupported message types
+        result.putAll(document);
+    }
+    
+    // Helper methods for parsing specific structures
+    private Map<String, Object> parsePaymentInstruction(Map<String, Object> payment) {
+        Map<String, Object> result = new HashMap<>();
+        
+        if (payment != null) {
+            result.put("paymentInformationId", safeGetString(payment, "PmtInfId"));
+            result.put("paymentMethod", safeGetString(payment, "PmtMtd"));
+            result.put("requestedExecutionDate", safeGetString(payment, "ReqdExctnDt"));
+            
+            Map<String, Object> debtor = safeGetMap(payment, "Dbtr");
+            if (debtor != null) {
+                result.put("debtorName", safeGetString(debtor, "Nm"));
+            }
+            
+            Map<String, Object> debtorAccount = safeGetMap(payment, "DbtrAcct");
+            if (debtorAccount != null) {
+                result.put("debtorAccount", parseAccountInfo(debtorAccount));
+            }
+        }
+        
+        return result;
+    }
+    
+    private Map<String, Object> parseCreditTransferTransaction(Map<String, Object> transaction) {
+        Map<String, Object> result = new HashMap<>();
+        
+        if (transaction != null) {
+            Map<String, Object> paymentId = safeGetMap(transaction, "PmtId");
+            if (paymentId != null) {
+                result.put("instructionId", safeGetString(paymentId, "InstrId"));
+                result.put("endToEndId", safeGetString(paymentId, "EndToEndId"));
+            }
+            
+            Map<String, Object> amount = safeGetMap(transaction, "Amt");
+            if (amount != null) {
+                Map<String, Object> instructedAmount = safeGetMap(amount, "InstdAmt");
+                if (instructedAmount != null) {
+                    result.put("amount", safeGetString(instructedAmount, "value"));
+                    result.put("currency", safeGetString(instructedAmount, "Ccy"));
+                }
+            }
+        }
+        
+        return result;
+    }
+    
+    private Map<String, Object> parseAccountInfo(Map<String, Object> account) {
+        Map<String, Object> result = new HashMap<>();
+        
+        if (account != null) {
+            Map<String, Object> id = safeGetMap(account, "Id");
+            if (id != null) {
+                result.put("iban", safeGetString(id, "IBAN"));
+                Map<String, Object> other = safeGetMap(id, "Othr");
+                if (other != null) {
+                    result.put("otherAccountId", safeGetString(other, "Id"));
+                }
+            }
+            
+            result.put("currency", safeGetString(account, "Ccy"));
+            result.put("name", safeGetString(account, "Nm"));
+        }
+        
+        return result;
+    }
+    
+    private List<Map<String, Object>> parseBalances(Object balanceObj) {
+        List<Map<String, Object>> balances = new ArrayList<>();
+        
+        if (balanceObj instanceof List) {
+            List<Map<String, Object>> balanceList = safeGetList(Collections.singletonMap("temp", balanceObj), "temp");
+            for (Map<String, Object> balance : balanceList) {
+                balances.add(parseBalance(balance));
+            }
+        } else if (balanceObj instanceof Map) {
+            balances.add(parseBalance((Map<String, Object>) balanceObj));
+        }
+        
+        return balances;
+    }
+    
+    private Map<String, Object> parseBalance(Map<String, Object> balance) {
+        Map<String, Object> result = new HashMap<>();
+        
+        if (balance != null) {
+            Map<String, Object> type = safeGetMap(balance, "Tp");
+            if (type != null) {
+                Map<String, Object> codeOrProprietary = safeGetMap(type, "CdOrPrtry");
+                if (codeOrProprietary != null) {
+                    result.put("balanceType", safeGetString(codeOrProprietary, "Cd"));
+                }
+            }
+            
+            Map<String, Object> amount = safeGetMap(balance, "Amt");
+            if (amount != null) {
+                result.put("amount", safeGetString(amount, "value"));
+                result.put("currency", safeGetString(amount, "Ccy"));
+            }
+            
+            result.put("creditDebitIndicator", safeGetString(balance, "CdtDbtInd"));
+            
+            Map<String, Object> date = safeGetMap(balance, "Dt");
+            if (date != null) {
+                result.put("date", safeGetString(date, "Dt"));
+            }
+        }
+        
+        return result;
+    }
+    
+    private List<Map<String, Object>> parseStatementEntries(Object entriesObj) {
+        List<Map<String, Object>> entries = new ArrayList<>();
+        
+        if (entriesObj instanceof List) {
+            List<Map<String, Object>> entryList = safeGetList(Collections.singletonMap("temp", entriesObj), "temp");
+            for (Map<String, Object> entry : entryList) {
+                entries.add(parseStatementEntry(entry));
+            }
+        } else if (entriesObj instanceof Map) {
+            entries.add(parseStatementEntry((Map<String, Object>) entriesObj));
+        }
+        
+        return entries;
+    }
+    
+    private Map<String, Object> parseStatementEntry(Map<String, Object> entry) {
+        Map<String, Object> result = new HashMap<>();
+        
+        if (entry != null) {
+            Map<String, Object> amount = safeGetMap(entry, "Amt");
+            if (amount != null) {
+                result.put("amount", safeGetString(amount, "value"));
+                result.put("currency", safeGetString(amount, "Ccy"));
+            }
+            
+            result.put("creditDebitIndicator", safeGetString(entry, "CdtDbtInd"));
+            result.put("status", safeGetString(entry, "Sts"));
+            result.put("accountServicerReference", safeGetString(entry, "AcctSvcrRef"));
+            
+            Map<String, Object> bookingDate = safeGetMap(entry, "BookgDt");
+            if (bookingDate != null) {
+                result.put("bookingDate", safeGetString(bookingDate, "Dt"));
+            }
+            
+            Map<String, Object> valueDate = safeGetMap(entry, "ValDt");
+            if (valueDate != null) {
+                result.put("valueDate", safeGetString(valueDate, "Dt"));
+            }
+        }
+        
+        return result;
+    }
+    
+    private String extractMessageTypeFromNamespace(String namespace) {
+        if (namespace == null) return "unknown";
+        
+        Pattern pattern = Pattern.compile("urn:iso:std:iso:20022:tech:xsd:([^:]+)");
+        java.util.regex.Matcher matcher = pattern.matcher(namespace);
+        
+        return matcher.find() ? matcher.group(1) : "unknown";
+    }
+    
+    private String mapRootElementToMessageType(String rootElement) {
+        // Map common root elements to message types
+        Map<String, String> mapping = Map.of(
+            "CstmrCdtTrfInitn", "pain.001.001.03",
+            "FIToFICstmrCdtTrf", "pacs.008.001.02",
+            "BkToCstmrStmt", "camt.053.001.02"
+        );
+        
+        return mapping.getOrDefault(rootElement, "unknown");
+    }
+    
+    private Map<String, ISO20022MessageType> initializeMessageTypes() {
+        Map<String, ISO20022MessageType> types = new HashMap<>();
+        
+        types.put("pain.001.001.03", ISO20022MessageType.builder()
+            .messageId("pain.001.001.03")
+            .description("Customer Credit Transfer Initiation V03")
+            .businessArea("Payments Initiation")
+            .schemaValidationEnabled(true)
+            .build());
+            
+        types.put("pain.001.001.09", ISO20022MessageType.builder()
+            .messageId("pain.001.001.09")
+            .description("Customer Credit Transfer Initiation V09")
+            .businessArea("Payments Initiation")
+            .schemaValidationEnabled(true)
+            .build());
+            
+        types.put("pacs.008.001.02", ISO20022MessageType.builder()
+            .messageId("pacs.008.001.02")
+            .description("Financial Institution Customer Credit Transfer V02")
+            .businessArea("Payments Clearing and Settlement")
+            .schemaValidationEnabled(true)
+            .build());
+            
+        types.put("pacs.008.001.08", ISO20022MessageType.builder()
+            .messageId("pacs.008.001.08")
+            .description("Financial Institution Customer Credit Transfer V08")
+            .businessArea("Payments Clearing and Settlement")
+            .schemaValidationEnabled(true)
+            .build());
+            
+        types.put("camt.053.001.02", ISO20022MessageType.builder()
+            .messageId("camt.053.001.02")
+            .description("Bank to Customer Statement V02")
+            .businessArea("Cash Management")
+            .schemaValidationEnabled(true)
+            .build());
+            
+        types.put("camt.053.001.08", ISO20022MessageType.builder()
+            .messageId("camt.053.001.08")
+            .description("Bank to Customer Statement V08")
+            .businessArea("Cash Management")
+            .schemaValidationEnabled(true)
+            .build());
+            
+        return types;
+    }
+    
+    @Data
+    @Builder
+    public static class ISO20022MessageType {
+        private String messageId;
+        private String description;
+        private String businessArea;
+        private boolean schemaValidationEnabled;
+    }
+    
+    @Data
+    @Builder
+    public static class ISO20022ParseResult {
+        private String messageType;
+        private Map<String, Object> parsedFields;
+        private boolean valid;
+        private boolean schemaValidated;
+        private boolean streamParsed;
+        private long processingTimeMs;
+        private List<String> errors;
+        private List<String> warnings;
+    }
+}
+
+// ===== ENHANCED EXCEPTION HANDLING WITH SECURITY-CONSCIOUS LOGGING =====
+public class FinancialDataException extends RuntimeException {
+    private final String errorCode;
+    private final Map<String, Object> context;
+    private final String userMessage;
+    private final boolean containsSensitiveData;
+    
+    public FinancialDataException(String errorCode, String message, Map<String, Object> context) {
+        this(errorCode, message, context, null, false);
+    }
+    
+    public FinancialDataException(String errorCode, String message, Map<String, Object> context, 
+                                Throwable cause) {
+        this(errorCode, message, context, cause, false);
+    }
+    
+    public FinancialDataException(String errorCode, String message, Map<String, Object> context, 
+                                Throwable cause, boolean containsSensitiveData) {
+        super(message, cause);
+        this.errorCode = errorCode;
+        this.context = sanitizeContext(context);
+        this.userMessage = generateUserFriendlyMessage(errorCode);
+        this.containsSensitiveData = containsSensitiveData;
+    }
+    
+    private Map<String, Object> sanitizeContext(Map<String, Object> context) {
+        if (context == null) return new HashMap<>();
+        
+        Map<String, Object> sanitized = new HashMap<>();
+        Set<String> sensitiveFields = Set.of("password", "token", "key", "secret", "credential", 
+                                           "ssn", "account", "card", "pin");
+        
+        for (Map.Entry<String, Object> entry : context.entrySet()) {
+            String key = entry.getKey().toLowerCase();
+            Object value = entry.getValue();
+            
+            // Check if field contains sensitive data
+            boolean isSensitive = sensitiveFields.stream().anyMatch(key::contains);
+            
+            if (isSensitive) {
+                sanitized.put(entry.getKey(), maskSensitiveValue(value));
+            } else if (value instanceof String && ((String) value).length() > 1000) {
+                // Truncate very long strings to prevent log flooding
+                sanitized.put(entry.getKey(), ((String) value).substring(0, 1000) + "...[TRUNCATED]");
+            } else {
+                sanitized.put(entry.getKey(), value);
+            }
+        }
+        
+        return sanitized;
+    }
+    
+    private String maskSensitiveValue(Object value) {
+        if (value == null) return null;
+        
+        String strValue = value.toString();
+        if (strValue.length() <= 4) {
+            return "****";
+        } else {
+            return strValue.substring(0, 2) + "****" + strValue.substring(strValue.length() - 2);
+        }
+    }
+    
+    private String generateUserFriendlyMessage(String errorCode) {
+        Map<String, String> userMessages = Map.of(
+            "TENANT_NULL", "Invalid tenant information provided",
+            "INVALID_TENANT_ID", "Tenant identifier format is invalid",
+            "CREDENTIAL_RETRIEVAL_FAILED", "Unable to access required credentials",
+            "PARSE_ERROR", "Unable to process the provided data format",
+            "VALIDATION_FAILED", "Data validation requirements not met",
+            "SCHEMA_VALIDATION_FAILED", "Data does not conform to expected format",
+            "CONNECTION_FAILED", "Unable to connect to external service",
+            "TIMEOUT", "Operation timed out - please retry"
+        );
+        
+        return userMessages.getOrDefault(errorCode, "An unexpected error occurred");
+    }
+    
+    // Getters
+    public String getErrorCode() { return errorCode; }
+    public Map<String, Object> getContext() { return context; }
+    public String getUserMessage() { return userMessage; }
+    public boolean containsSensitiveData() { return containsSensitiveData; }
+    
+    /**
+     * Returns a logging-safe version of the exception with sensitive data removed
+     */
+    public Map<String, Object> getLoggingContext() {
+        Map<String, Object> loggingContext = new HashMap<>();
+        loggingContext.put("errorCode", errorCode);
+        loggingContext.put("userMessage", userMessage);
+        loggingContext.put("timestamp", LocalDateTime.now().toString());
+        loggingContext.put("tenantId", TenantContextHolder.getCurrentTenantId());
+        
+        if (!containsSensitiveData && !context.isEmpty()) {
+            loggingContext.put("context", context);
+        }
+        
+        if (getCause() != null) {
+            loggingContext.put("causeType", getCause().getClass().getSimpleName());
+            loggingContext.put("causeMessage", getCause().getMessage());
+        }
+        
+        return loggingContext;
+    }
+}
+
+public class TenantValidationException extends FinancialDataException {
+    public TenantValidationException(String errorCode, String message, Map<String, Object> context) {
+        super(errorCode, message, context, null, true); // Tenant data is considered sensitive
+    }
+    
+    public TenantValidationException(String errorCode, String message, Map<String, Object> context, 
+                                   Throwable cause) {
+        super(errorCode, message, context, cause, true);
+    }
+}
+
+public class CredentialException extends FinancialDataException {
+    public CredentialException(String errorCode, String message, Map<String, Object> context) {
+        super(errorCode, message, context, null, true); // Credentials are always sensitive
+    }
+    
+    public CredentialException(String errorCode, String message, Map<String, Object> context, 
+                             Throwable cause) {
+        super(errorCode, message, context, cause, true);
+    }
+}
+
+public class ISO20022ParseException extends FinancialDataException {
+    public ISO20022ParseException(String errorCode, String message, Map<String, Object> context) {
+        super(errorCode, message, context);
+    }
+    
+    public ISO20022ParseException(String errorCode, String message, Map<String, Object> context, 
+                                Throwable cause) {
+        super(errorCode, message, context, cause);
+    }
+}
+
+// ===== COMPREHENSIVE TESTING FRAMEWORK =====
+/*
+Enhanced Test Structure:
+
+src/test/java/
+├── unit/
+│   ├── tenant/
+│   │   ├── TenantContextManagerTest.java
+│   │   └── TenantValidatorTest.java
+│   ├── credential/
+│   │   ├── EnhancedCredentialManagerTest.java
+│   │   └── CredentialCacheTest.java
+│   ├── parser/
+│   │   ├── EnhancedISO20022ParserTest.java
+│   │   ├── ISO20022SchemaValidationTest.java
+│   │   └── StreamParsingTest.java
+│   └── exception/
+│       └── ExceptionHandlingTest.java
+├── integration/
+│   ├── security/
+│   │   ├── TenantIsolationTest.java
+│   │   └── CredentialSecurityTest.java
+│   ├── performance/
+│   │   ├── ParserPerformanceTest.java
+│   │   └── CachePerformanceTest.java
+│   └── resilience/
+│       └── CircuitBreakerIntegrationTest.java
+├── security/
+│   ├── PenetrationTest.java
+│   ├── TenantIsolationSecurityTest.java
+│   └── CredentialLeakageTest.java
+└── load/
+    ├── ISO20022LoadTest.java
+    └── ConcurrentTenantTest.java
+
+Example Test Implementation:
+
+@ExtendWith(MockitoExtension.class)
+class EnhancedTenantContextManagerTest {
+    
+    @Mock
+    private TenantValidator tenantValidator;
+    
+    @Mock
+    private MeterRegistry meterRegistry;
+    
+    @InjectMocks
+    private EnhancedTenantContextManager contextManager;
+    
+    @Test
+    void setTenantContext_ValidContext_Success() throws TenantValidationException {
+        // Given
+        SecureTenantContext context = SecureTenantContext.builder()
+            .tenantId("test-tenant-123")
+            .tenantName("Test Tenant")
+            .allowedConnectors(Set.of("connector1"))
+            .build();
+        
+        doNothing().when(tenantValidator).validateTenant("test-tenant-123");
+        when(meterRegistry.counter(any(String.class), any(Tags.class)))
+            .thenReturn(mock(Counter.class));
+        
+        // When
+        try (TenantContextHandle handle = contextManager.setTenantContext(context)) {
+            // Then
+            assertThat(contextManager.getCurrentTenantId()).isEqualTo("test-tenant-123");
+            verify(tenantValidator).validateTenant("test-tenant-123");
+        }
+    }
+    
+    @Test
+    void setTenantContext_InvalidTenantId_ThrowsException() {
+        // Given
+        SecureTenantContext context = SecureTenantContext.builder()
+            .tenantId("invalid-tenant-id-with-special-chars!")
+            .tenantName("Test Tenant")
+            .build();
+        
+        // When & Then
+        assertThatThrownBy(() -> contextManager.setTenantContext(context))
+            .isInstanceOf(TenantValidationException.class)
+            .hasFieldOrPropertyWithValue("errorCode", "INVALID_TENANT_ID");
+    }
+    
+    @Test
+    void setTenantContext_MaliciousTenantProperties_SanitizesData() throws TenantValidationException {
+        // Given
+        Map<String, Object> maliciousProperties = Map.of(
+            "validProperty", "validValue",
+            "<script>alert('xss')</script>", "maliciousKey",
+            "longProperty", "x".repeat(1000),
+            "password", "secret123"
+        );
+        
+        SecureTenantContext context = SecureTenantContext.builder()
+            .tenantId("test-tenant")
+            .tenantName("Test Tenant")
+            .tenantProperties(maliciousProperties)
+            .build();
+        
+        doNothing().when(tenantValidator).validateTenant("test-tenant");
+        when(meterRegistry.counter(any(String.class), any(Tags.class)))
+            .thenReturn(mock(Counter.class));
+        
+        // When
+        try (TenantContextHandle handle = contextManager.setTenantContext(context)) {
+            SecureTenantContext sanitized = handle.getContext();
+            
+            // Then
+            assertThat(sanitized.getTenantProperties())
+                .containsKey("validProperty")
+                .doesNotContainKey("<script>alert('xss')</script>")
+                .hasEntrySatisfying("longProperty", value -> 
+                    assertThat(value.toString()).hasSize(500))
+                .hasEntrySatisfying("password", value -> 
+                    assertThat(value.toString()).matches(".*\\*\\*\\*\\*.*"));
+        }
+    }
+    
+    @Test
+    void contextCleanup_PreventMemoryLeaks() throws Exception {
+        // Given
+        int contextCount = 100;
+        List<TenantContextHandle> handles = new ArrayList<>();
+        
+        doNothing().when(tenantValidator).validateTenant(anyString());
+        when(meterRegistry.counter(any(String.class), any(Tags.class)))
+            .thenReturn(mock(Counter.class));
+        
+        // When - Create many contexts
+        for (int i = 0; i < contextCount; i++) {
+            SecureTenantContext context = SecureTenantContext.builder()
+                .tenantId("tenant-" + i)
+                .tenantName("Tenant " + i)
+                .build();
+            
+            handles.add(contextManager.setTenantContext(context));
+        }
+        
+        // Then - Close all handles
+        handles.forEach(TenantContextHandle::close);
+        
+        // Verify cleanup
+        Thread.sleep(100); // Allow cleanup to complete
+        assertThat(contextManager.getCurrentTenantId()).isEqualTo("default");
+    }
+}
+
+@SpringBootTest
+@Testcontainers
+class ISO20022ParserIntegrationTest {
+    
+    @Container
+    static VaultContainer vault = new VaultContainer("vault:latest")
+        .withVaultToken("root")
+        .withSecretInVault("secret/test", "key", "value");
+    
+    @Autowired
+    private EnhancedISO20022Parser parser;
+    
+    @Test
+    void parseValidPain001Message_WithSchemaValidation_Success() throws Exception {
+        // Given
+        String validPain001 = loadTestResource("pain001-valid.xml");
+        
+        // When
+        ISO20022ParseResult result = parser.parse(validPain001);
+        
+        // Then
+        assertThat(result.isValid()).isTrue();
+        assertThat(result.isSchemaValidated()).isTrue();
+        assertThat(result.getMessageType()).isEqualTo("pain.001.001.03");
+        assertThat(result.getParsedFields())
+            .containsKey("messageId")
+            .containsKey("numberOfTransactions");
+    }
+    
+    @Test
+    void parseInvalidXML_ThrowsSecureException() {
+        // Given
+        String maliciousXML = """
+            <?xml version="1.0"?>
+            <!DOCTYPE foo [
+                <!ENTITY xxe SYSTEM "file:///etc/passwd">
+            ]>
+            <Document>&xxe;</Document>
+            """;
+        
+        // When & Then
+        assertThatThrownBy(() -> parser.parse(maliciousXML))
+            .isInstanceOf(ISO20022ParseException.class)
+            .hasFieldOrPropertyWithValue("errorCode", "MALFORMED_XML");
+    }
+    
+    @Test
+    void parseLargeMessage_UsesStreamParsing() throws Exception {
+        // Given
+        InputStream largeMessage = generateLargeISO20022Message(10000); // 10K entries
+        
+        // When
+        long startTime = System.currentTimeMillis();
+        ISO20022ParseResult result = parser.parseStream(largeMessage);
+        long duration = System.currentTimeMillis() - startTime;
+        
+        // Then
+        assertThat(result.isStreamParsed()).isTrue();
+        assertThat(duration).isLessThan(5000); // Should complete within 5 seconds
+        assertThat(result.getParsedFields()).isNotEmpty();
+    }
+    
+    private String loadTestResource(String filename) throws IOException {
+        return new String(getClass().getResourceAsStream("/test-data/" + filename).readAllBytes());
+    }
+    
+    private InputStream generateLargeISO20022Message(int entryCount) {
+        // Generate large test message for performance testing
+        StringBuilder xml = new StringBuilder();
+        xml.append("<?xml version=\"1.0\"?>");
+        xml.append("<Document xmlns=\"urn:iso:std:iso:20022:tech:xsd:camt.053.001.02\">");
+        xml.append("<BkToCstmrStmt>");
+        xml.append("<Stmt>");
+        
+        for (int i = 0; i < entryCount; i++) {
+            xml.append("<Ntry>");
+            xml.append("<Amt Ccy=\"USD\">").append(100.00 + i).append("</Amt>");
+            xml.append("<CdtDbtInd>CRDT</CdtDbtInd>");
+            xml.append("<AcctSvcrRef>REF").append(i).append("</AcctSvcrRef>");
+            xml.append("</Ntry>");
+        }
+        
+        xml.append("</Stmt>");
+        xml.append("</BkToCstmrStmt>");
+        xml.append("</Document>");
+        
+        return new ByteArrayInputStream(xml.toString().getBytes());
+    }
+}
+
+// Security Penetration Test
+@SpringBootTest
+@ActiveProfiles("security-test")
+class SecurityPenetrationTest {
+    
+    @Test
+    void testTenantIsolationBypass_ShouldFail() {
+        // Test attempts to bypass tenant isolation
+        // This should always fail in a secure implementation
+    }
+    
+    @Test
+    void testCredentialExtraction_ShouldFail() {
+        // Test attempts to extract credentials from logs or errors
+        // This should always fail in a secure implementation
+    }
+    
+    @Test
+    void testXXEAttack_ShouldBeBlocked() {
+        // Test XML External Entity attacks
+        // These should be blocked by secure XML parsing configuration
+    }
+}
+
+// Load Testing with Gatling
+class ISO20022LoadTest extends Simulation {
+    
+    private final HttpProtocolBuilder httpProtocol = http
+        .baseUrl("http://localhost:8080")
+        .acceptHeader("application/json")
+        .contentTypeHeader("application/json");
+    
+    private final ScenarioBuilder scenario = scenario("ISO20022 Parse Load Test")
+        .exec(http("parse-pain001")
+            .post("/api/v1/parse/iso20022")
+            .body(StringBody("${pain001Message}"))
+            .check(status().is(200))
+            .check(jsonPath("$.valid").is("true")))
+        .pause(Duration.ofMillis(100));
+    
+    {
+        setUp(
+            scenario.injectOpen(
+                rampUsersPerSec(1).to(50).during(Duration.ofMinutes(2)),
+                constantUsersPerSec(50).during(Duration.ofMinutes(5)),
+                rampUsersPerSec(50).to(100).during(Duration.ofMinutes(2)),
+                constantUsersPerSec(100).during(Duration.ofMinutes(10))
+            )
+        ).protocols(httpProtocol);
+    }
+}
+*/
+
+// ===== ENHANCED MONITORING AND ALERTING =====
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class EnhancedMonitoringService {
+    
+    private final MeterRegistry meterRegistry;
+    private final AlertingService alertingService;
+    
+    @EventListener
+    public void handleException(FinancialDataException exception) {
+        // Log exception with secure context
+        Map<String, Object> loggingContext = exception.getLoggingContext();
+        
+        if (exception.containsSensitiveData()) {
+            log.error("Financial data exception occurred: {} - {}", 
+                     exception.getErrorCode(), exception.getUserMessage());
+            log.debug("Exception context (sensitive data masked): {}", loggingContext);
+        } else {
+            log.error("Financial data exception occurred: {} - {} Context: {}", 
+                     exception.getErrorCode(), exception.getUserMessage(), loggingContext);
+        }
+        
+        // Update error metrics
+        Counter errorCounter = Counter.builder("financial.exception")
+            .tag("errorCode", exception.getErrorCode())
+            .tag("tenant", TenantContextHolder.getCurrentTenantId())
+            .register(meterRegistry);
+        errorCounter.increment();
+        
+        // Trigger alerts for critical errors
+        if (isCriticalError(exception.getErrorCode())) {
+            alertingService.sendCriticalAlert(exception);
+        }
+    }
+    
+    private boolean isCriticalError(String errorCode) {
+        Set<String> criticalErrors = Set.of(
+            "CREDENTIAL_RETRIEVAL_FAILED",
+            "TENANT_VALIDATION_FAILED", 
+            "SCHEMA_VALIDATION_FAILED",
+            "SECURITY_VIOLATION"
+        );
+        return criticalErrors.contains(errorCode);
+    }
+}
+
+@Component
+@Slf4j
+public class AlertingService {
+    
+    public void sendCriticalAlert(FinancialDataException exception) {
+        // In production, integrate with alerting system (PagerDuty, Slack, etc.)
+        log.error("CRITICAL ALERT: {} - Tenant: {} - Time: {}", 
+                 exception.getErrorCode(),
+                 TenantContextHolder.getCurrentTenantId(),
+                 LocalDateTime.now());
+    }
+}
+
+// ===== MAIN APPLICATION =====
+@SpringBootApplication
+@EnableConfigurationProperties({IngestionConfigProperties.class, CredentialManagerConfig.class})
+@EnableAsync
+public class EnhancedFinancialDataIngestionApplication {
+    
+    public static void main(String[] args) {
+        SpringApplication.run(EnhancedFinancialDataIngestionApplication.class, args);
+    }
+    
+    @Bean
+    public ObjectMapper objectMapper() {
+        return new ObjectMapper()
+            .findAndRegisterModules()
+            .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+    }
+    
+    @Bean
+    public Validator validator() {
+        return Validation.buildDefaultValidatorFactory().getValidator();
+    }
+}
