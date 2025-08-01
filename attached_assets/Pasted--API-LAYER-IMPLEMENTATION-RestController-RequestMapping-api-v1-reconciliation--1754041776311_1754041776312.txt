@@ -1,0 +1,635 @@
+// ===== API LAYER IMPLEMENTATION =====
+
+@RestController
+@RequestMapping("/api/v1/reconciliation")
+@RequiredArgsConstructor
+@Slf4j
+@Tag(name = "Reconciliation", description = "Reconciliation management endpoints")
+public class ReconciliationController {
+    
+    private final CoreReconciliationEngine reconciliationEngine;
+    private final ReconciliationJobRepository jobRepository;
+    private final ReconciliationMatchRepository matchRepository;
+    
+    @PostMapping("/jobs")
+    @Operation(summary = "Start reconciliation job")
+    @ApiResponses({
+        @ApiResponse(responseCode = "202", description = "Job accepted"),
+        @ApiResponse(responseCode = "400", description = "Invalid request"),
+        @ApiResponse(responseCode = "503", description = "Service unavailable")
+    })
+    public ResponseEntity<ReconciliationJobResponse> startReconciliation(
+            @Valid @RequestBody ReconciliationRequestDTO request,
+            @RequestHeader("X-Tenant-ID") String tenantId) {
+        
+        try {
+            ReconciliationRequest internalRequest = mapToInternalRequest(request, tenantId);
+            CompletableFuture<ReconciliationResult> futureResult = reconciliationEngine.startReconciliation(internalRequest);
+            
+            // Return immediately with job ID
+            String jobId = extractJobIdFromFuture(futureResult);
+            
+            ReconciliationJobResponse response = ReconciliationJobResponse.builder()
+                .jobId(jobId)
+                .status("ACCEPTED")
+                .message("Reconciliation job started successfully")
+                .links(Map.of(
+                    "self", "/api/v1/reconciliation/jobs/" + jobId,
+                    "matches", "/api/v1/reconciliation/jobs/" + jobId + "/matches"
+                ))
+                .build();
+            
+            return ResponseEntity.accepted()
+                .location(URI.create("/api/v1/reconciliation/jobs/" + jobId))
+                .body(response);
+                
+        } catch (ValidationException e) {
+            throw new BadRequestException("INVALID_REQUEST", e.getMessage());
+        }
+    }
+    
+    @GetMapping("/jobs/{jobId}")
+    @Operation(summary = "Get reconciliation job status")
+    public ResponseEntity<ReconciliationJobDetailDTO> getJobStatus(
+            @PathVariable String jobId,
+            @RequestHeader("X-Tenant-ID") String tenantId) {
+        
+        ReconciliationJob job = jobRepository.findByJobIdAndTenantId(jobId, tenantId)
+            .orElseThrow(() -> new ResourceNotFoundException("JOB_NOT_FOUND", 
+                "Reconciliation job not found: " + jobId));
+        
+        return ResponseEntity.ok(mapToJobDetailDTO(job));
+    }
+    
+    @GetMapping("/jobs/{jobId}/matches")
+    @Operation(summary = "Get reconciliation matches")
+    public ResponseEntity<PagedResponse<ReconciliationMatchDTO>> getMatches(
+            @PathVariable String jobId,
+            @RequestHeader("X-Tenant-ID") String tenantId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "100") int size,
+            @RequestParam(required = false) ReconciliationMatch.MatchStatus status) {
+        
+        // Verify job belongs to tenant
+        jobRepository.findByJobIdAndTenantId(jobId, tenantId)
+            .orElseThrow(() -> new ResourceNotFoundException("JOB_NOT_FOUND", 
+                "Reconciliation job not found: " + jobId));
+        
+        Page<ReconciliationMatch> matches = matchRepository.findByJobIdWithPagination(
+            jobId, status, PageRequest.of(page, size));
+        
+        return ResponseEntity.ok(mapToPagedResponse(matches));
+    }
+    
+    @PatchMapping("/matches/{matchId}")
+    @Operation(summary = "Update match status (manual review)")
+    public ResponseEntity<ReconciliationMatchDTO> updateMatch(
+            @PathVariable Long matchId,
+            @RequestHeader("X-Tenant-ID") String tenantId,
+            @RequestHeader("X-User-ID") String userId,
+            @Valid @RequestBody MatchUpdateRequest updateRequest) {
+        
+        ReconciliationMatch match = matchRepository.findByIdAndTenantId(matchId, tenantId)
+            .orElseThrow(() -> new ResourceNotFoundException("MATCH_NOT_FOUND", 
+                "Match not found: " + matchId));
+        
+        // Update match based on review
+        match.setMatchStatus(updateRequest.getNewStatus());
+        match.setReviewedBy(userId);
+        match.setReviewedAt(LocalDateTime.now());
+        match.setReviewComments(updateRequest.getComments());
+        
+        ReconciliationMatch updated = matchRepository.save(match);
+        
+        // Publish review event
+        publishMatchReviewEvent(updated);
+        
+        return ResponseEntity.ok(mapToMatchDTO(updated));
+    }
+}
+
+// ===== GLOBAL EXCEPTION HANDLING =====
+
+@ControllerAdvice
+@Slf4j
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class GlobalExceptionHandler {
+    
+    @ExceptionHandler(FinancialDataException.class)
+    public ResponseEntity<ErrorResponse> handleFinancialDataException(FinancialDataException e) {
+        log.error("Financial data exception: {} - {}", e.getErrorCode(), e.getMessage(), e);
+        
+        ErrorResponse errorResponse = ErrorResponse.builder()
+            .errorCode(e.getErrorCode())
+            .message(e.getMessage())
+            .context(e.getContext())
+            .timestamp(LocalDateTime.now())
+            .traceId(MDC.get("traceId"))
+            .build();
+        
+        HttpStatus status = determineHttpStatus(e.getErrorCode());
+        return ResponseEntity.status(status).body(errorResponse);
+    }
+    
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ErrorResponse> handleValidationException(MethodArgumentNotValidException e) {
+        Map<String, String> validationErrors = e.getBindingResult()
+            .getFieldErrors()
+            .stream()
+            .collect(Collectors.toMap(
+                FieldError::getField,
+                FieldError::getDefaultMessage
+            ));
+        
+        ErrorResponse errorResponse = ErrorResponse.builder()
+            .errorCode("VALIDATION_ERROR")
+            .message("Request validation failed")
+            .context(Map.of("validationErrors", validationErrors))
+            .timestamp(LocalDateTime.now())
+            .traceId(MDC.get("traceId"))
+            .build();
+        
+        return ResponseEntity.badRequest().body(errorResponse);
+    }
+    
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleGenericException(Exception e) {
+        log.error("Unexpected error", e);
+        
+        ErrorResponse errorResponse = ErrorResponse.builder()
+            .errorCode("INTERNAL_ERROR")
+            .message("An unexpected error occurred")
+            .timestamp(LocalDateTime.now())
+            .traceId(MDC.get("traceId"))
+            .build();
+        
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorResponse);
+    }
+    
+    private HttpStatus determineHttpStatus(String errorCode) {
+        if (errorCode.contains("NOT_FOUND")) return HttpStatus.NOT_FOUND;
+        if (errorCode.contains("UNAUTHORIZED")) return HttpStatus.UNAUTHORIZED;
+        if (errorCode.contains("FORBIDDEN")) return HttpStatus.FORBIDDEN;
+        if (errorCode.contains("INVALID") || errorCode.contains("VALIDATION")) return HttpStatus.BAD_REQUEST;
+        if (errorCode.contains("CONFLICT")) return HttpStatus.CONFLICT;
+        if (errorCode.contains("UNAVAILABLE")) return HttpStatus.SERVICE_UNAVAILABLE;
+        return HttpStatus.INTERNAL_SERVER_ERROR;
+    }
+}
+
+// ===== ENHANCED REPOSITORY IMPLEMENTATIONS =====
+
+@Repository
+public interface ReconciliationJobRepository extends JpaRepository<ReconciliationJob, Long> {
+    
+    @Query("SELECT j FROM ReconciliationJob j WHERE j.jobId = :jobId AND j.tenantId = :tenantId")
+    Optional<ReconciliationJob> findByJobIdAndTenantId(@Param("jobId") String jobId, 
+                                                       @Param("tenantId") String tenantId);
+    
+    @Query("SELECT j FROM ReconciliationJob j WHERE j.tenantId = :tenantId " +
+           "AND j.status = :status ORDER BY j.createdAt DESC")
+    Page<ReconciliationJob> findByTenantIdAndStatus(@Param("tenantId") String tenantId, 
+                                                    @Param("status") ReconciliationJob.ReconciliationStatus status,
+                                                    Pageable pageable);
+    
+    @Modifying
+    @Query("UPDATE ReconciliationJob j SET j.status = :status, j.errorMessage = :errorMessage " +
+           "WHERE j.jobId = :jobId")
+    void updateJobStatus(@Param("jobId") String jobId, 
+                        @Param("status") ReconciliationJob.ReconciliationStatus status,
+                        @Param("errorMessage") String errorMessage);
+}
+
+@Repository
+public interface ReconciliationMatchRepository extends JpaRepository<ReconciliationMatch, Long> {
+    
+    @Query("SELECT m FROM ReconciliationMatch m WHERE m.id = :id AND m.tenantId = :tenantId")
+    Optional<ReconciliationMatch> findByIdAndTenantId(@Param("id") Long id, 
+                                                     @Param("tenantId") String tenantId);
+    
+    @Query("SELECT m FROM ReconciliationMatch m WHERE m.jobId = :jobId " +
+           "AND (:status IS NULL OR m.matchStatus = :status)")
+    Page<ReconciliationMatch> findByJobIdWithPagination(@Param("jobId") String jobId,
+                                                       @Param("status") ReconciliationMatch.MatchStatus status,
+                                                       Pageable pageable);
+    
+    @Query("SELECT COUNT(m) FROM ReconciliationMatch m WHERE m.jobId = :jobId " +
+           "AND m.matchStatus = :status")
+    long countByJobIdAndStatus(@Param("jobId") String jobId, 
+                              @Param("status") ReconciliationMatch.MatchStatus status);
+}
+
+// ===== PRODUCTION ML MODEL MANAGEMENT =====
+
+@Component
+@Slf4j
+@RefreshScope
+public class MLModelManager {
+    
+    @Value("${ml.model.storage.path}")
+    private String modelStoragePath;
+    
+    @Value("${ml.model.version.strategy:latest}")
+    private String versionStrategy;
+    
+    private final Map<String, ModelWrapper> loadedModels = new ConcurrentHashMap<>();
+    private final MeterRegistry meterRegistry;
+    private final S3Client s3Client; // For cloud storage
+    
+    @PostConstruct
+    public void initializeModels() {
+        loadModel("fraud-detection", "RandomForest");
+        loadModel("anomaly-clustering", "KMeans");
+    }
+    
+    @Scheduled(fixedDelay = 3600000) // Check for updates every hour
+    public void checkForModelUpdates() {
+        log.info("Checking for ML model updates");
+        
+        for (String modelName : loadedModels.keySet()) {
+            try {
+                ModelMetadata latestMetadata = getLatestModelMetadata(modelName);
+                ModelWrapper currentModel = loadedModels.get(modelName);
+                
+                if (shouldUpdateModel(currentModel, latestMetadata)) {
+                    updateModel(modelName, latestMetadata);
+                }
+            } catch (Exception e) {
+                log.error("Failed to check updates for model: {}", modelName, e);
+                meterRegistry.counter("ml.model.update.failed", "model", modelName).increment();
+            }
+        }
+    }
+    
+    public <T> T getModel(String modelName, Class<T> modelClass) {
+        ModelWrapper wrapper = loadedModels.get(modelName);
+        if (wrapper == null) {
+            throw new ModelNotFoundException("Model not found: " + modelName);
+        }
+        
+        // Record model usage
+        meterRegistry.counter("ml.model.usage", "model", modelName).increment();
+        
+        return modelClass.cast(wrapper.getModel());
+    }
+    
+    private void loadModel(String modelName, String modelType) {
+        try {
+            ModelMetadata metadata = getLatestModelMetadata(modelName);
+            byte[] modelData = downloadModel(metadata);
+            
+            Object model = deserializeModel(modelData, modelType);
+            
+            ModelWrapper wrapper = ModelWrapper.builder()
+                .modelName(modelName)
+                .modelType(modelType)
+                .version(metadata.getVersion())
+                .model(model)
+                .loadedAt(LocalDateTime.now())
+                .metadata(metadata)
+                .build();
+            
+            loadedModels.put(modelName, wrapper);
+            
+            log.info("Loaded ML model: {} version: {}", modelName, metadata.getVersion());
+            meterRegistry.gauge("ml.model.version", Tags.of("model", modelName), metadata.getVersion());
+            
+        } catch (Exception e) {
+            log.error("Failed to load model: {}", modelName, e);
+            throw new ModelLoadException("Failed to load model: " + modelName, e);
+        }
+    }
+    
+    @Data
+    @Builder
+    private static class ModelWrapper {
+        private String modelName;
+        private String modelType;
+        private String version;
+        private Object model;
+        private LocalDateTime loadedAt;
+        private ModelMetadata metadata;
+    }
+}
+
+// ===== ENHANCED CONFIGURATION MANAGEMENT =====
+
+@Entity
+@Table(name = "reconciliation_configurations")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class ReconciliationConfigurationEntity {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false, unique = true)
+    private String configurationName;
+    
+    @Column(nullable = false)
+    private String tenantId;
+    
+    @Enumerated(EnumType.STRING)
+    private ReconciliationJob.ReconciliationType reconciliationType;
+    
+    private Double fuzzyMatchThreshold;
+    private Boolean enableRuleBasedMatching;
+    
+    @ElementCollection
+    @CollectionTable(name = "recon_config_matching_fields")
+    private List<String> matchingFields;
+    
+    @OneToMany(cascade = CascadeType.ALL, orphanRemoval = true)
+    @JoinColumn(name = "configuration_id")
+    private List<ReconciliationRule> rules;
+    
+    @Version
+    private Integer version;
+    
+    private LocalDateTime createdAt;
+    private LocalDateTime updatedAt;
+    private String createdBy;
+    private String updatedBy;
+    
+    @Column(nullable = false)
+    private Boolean isActive = true;
+}
+
+@Entity
+@Table(name = "reconciliation_rules")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class ReconciliationRule {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    private String ruleName;
+    private String ruleExpression; // Could be Drools DSL or custom format
+    private Integer priority;
+    private Boolean isActive;
+    
+    @Enumerated(EnumType.STRING)
+    private RuleType ruleType;
+    
+    public enum RuleType {
+        MATCHING, VALIDATION, TRANSFORMATION, EXCEPTION
+    }
+}
+
+// ===== KAFKA SCHEMA REGISTRY INTEGRATION =====
+
+@Configuration
+@EnableKafka
+public class KafkaConfiguration {
+    
+    @Value("${kafka.bootstrap.servers}")
+    private String bootstrapServers;
+    
+    @Value("${kafka.schema.registry.url}")
+    private String schemaRegistryUrl;
+    
+    @Bean
+    public ProducerFactory<String, GenericRecord> producerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class);
+        props.put("schema.registry.url", schemaRegistryUrl);
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.RETRIES_CONFIG, 3);
+        
+        return new DefaultKafkaProducerFactory<>(props);
+    }
+    
+    @Bean
+    public ConsumerFactory<String, GenericRecord> consumerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, KafkaAvroDeserializer.class);
+        props.put("schema.registry.url", schemaRegistryUrl);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        
+        return new DefaultKafkaConsumerFactory<>(props);
+    }
+    
+    @Bean
+    public KafkaTransactionManager kafkaTransactionManager(ProducerFactory<String, GenericRecord> producerFactory) {
+        return new KafkaTransactionManager<>(producerFactory);
+    }
+}
+
+// ===== HEALTH CHECKS AND MONITORING =====
+
+@Component
+public class ReconciliationHealthIndicator implements HealthIndicator {
+    
+    private final ReconciliationJobRepository jobRepository;
+    private final KafkaTemplate<String, GenericRecord> kafkaTemplate;
+    
+    @Override
+    public Health health() {
+        try {
+            // Check database connectivity
+            long activeJobs = jobRepository.countByStatus(ReconciliationJob.ReconciliationStatus.RUNNING);
+            
+            // Check Kafka connectivity
+            ListenableFuture<SendResult<String, GenericRecord>> future = 
+                kafkaTemplate.send("health-check-topic", "ping", null);
+            future.get(5, TimeUnit.SECONDS);
+            
+            Map<String, Object> details = Map.of(
+                "activeJobs", activeJobs,
+                "kafkaStatus", "UP",
+                "databaseStatus", "UP"
+            );
+            
+            return Health.up().withDetails(details).build();
+            
+        } catch (Exception e) {
+            return Health.down().withException(e).build();
+        }
+    }
+}
+
+@RestController
+@RequestMapping("/actuator/custom")
+public class CustomActuatorEndpoints {
+    
+    private final MLModelManager modelManager;
+    private final ReconciliationJobRepository jobRepository;
+    
+    @GetMapping("/ml-models")
+    public ResponseEntity<Map<String, Object>> getMLModelsStatus() {
+        Map<String, Object> modelsStatus = modelManager.getLoadedModelsStatus();
+        return ResponseEntity.ok(modelsStatus);
+    }
+    
+    @GetMapping("/reconciliation-stats")
+    public ResponseEntity<ReconciliationStats> getReconciliationStats(
+            @RequestParam(defaultValue = "24") int hours) {
+        
+        LocalDateTime since = LocalDateTime.now().minusHours(hours);
+        ReconciliationStats stats = calculateStats(since);
+        
+        return ResponseEntity.ok(stats);
+    }
+}
+
+// ===== ENHANCED ENTITY DEDUPLICATION ENGINE =====
+
+@Component
+@Slf4j
+public class EntityDeduplicationEngine {
+    
+    private final EntityRecordRepository entityRepository;
+    private final ElasticsearchClient elasticsearchClient;
+    private final MLModelManager modelManager;
+    
+    public List<EntityRecord> findPotentialDuplicates(EntityData entityData) {
+        List<EntityRecord> candidates = new ArrayList<>();
+        
+        // Phase 1: Elasticsearch fuzzy search
+        candidates.addAll(elasticsearchFuzzySearch(entityData));
+        
+        // Phase 2: Database exact/partial matches
+        candidates.addAll(databaseSearch(entityData));
+        
+        // Phase 3: ML-based similarity scoring
+        candidates = filterByMLSimilarity(entityData, candidates);
+        
+        // Phase 4: Rule-based filtering
+        candidates = applyDeduplicationRules(entityData, candidates);
+        
+        return candidates.stream()
+            .distinct()
+            .sorted(Comparator.comparing(EntityRecord::getIsGoldenRecord).reversed())
+            .collect(Collectors.toList());
+    }
+    
+    private List<EntityRecord> elasticsearchFuzzySearch(EntityData entityData) {
+        SearchRequest searchRequest = SearchRequest.of(s -> s
+            .index("entities")
+            .query(q -> q
+                .bool(b -> b
+                    .should(sh -> sh
+                        .match(m -> m
+                            .field("primaryName")
+                            .query(entityData.getPrimaryName())
+                            .fuzziness("AUTO")
+                        )
+                    )
+                    .should(sh -> sh
+                        .match(m -> m
+                            .field("aliases")
+                            .query(entityData.getPrimaryName())
+                        )
+                    )
+                    .should(sh -> sh
+                        .term(t -> t
+                            .field("primaryIdentifier")
+                            .value(entityData.getPrimaryIdentifier())
+                        )
+                    )
+                    .minimumShouldMatch("1")
+                )
+            )
+            .size(20)
+        );
+        
+        try {
+            SearchResponse<EntityRecord> response = elasticsearchClient.search(searchRequest, EntityRecord.class);
+            return response.hits().hits().stream()
+                .map(Hit::source)
+                .collect(Collectors.toList());
+        } catch (Exception e) {
+            log.error("Elasticsearch search failed", e);
+            return List.of();
+        }
+    }
+}
+
+// ===== DTO CLASSES =====
+
+@Data
+@Builder
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class ReconciliationRequestDTO {
+    @NotNull
+    private ReconciliationJob.ReconciliationType type;
+    
+    @NotBlank
+    private String sourceDataset;
+    
+    @NotBlank
+    private String targetDataset;
+    
+    private ReconciliationConfigurationDTO configuration;
+}
+
+@Data
+@Builder
+public class ReconciliationJobResponse {
+    private String jobId;
+    private String status;
+    private String message;
+    private Map<String, String> links;
+}
+
+@Data
+@Builder
+public class ErrorResponse {
+    private String errorCode;
+    private String message;
+    private Map<String, Object> context;
+    private LocalDateTime timestamp;
+    private String traceId;
+}
+
+// ===== PRODUCTION CONFIGURATION =====
+
+@Configuration
+@EnableCaching
+@EnableRetry
+public class ProductionConfiguration {
+    
+    @Bean
+    public CacheManager cacheManager(RedisConnectionFactory connectionFactory) {
+        RedisCacheConfiguration config = RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(10))
+            .serializeKeysWith(RedisSerializationContext.SerializationPair.fromSerializer(new StringRedisSerializer()))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair.fromSerializer(new GenericJackson2JsonRedisSerializer()));
+        
+        return RedisCacheManager.builder(connectionFactory)
+            .cacheDefaults(config)
+            .build();
+    }
+    
+    @Bean
+    public RestTemplate restTemplate(RestTemplateBuilder builder) {
+        return builder
+            .setConnectTimeout(Duration.ofSeconds(5))
+            .setReadTimeout(Duration.ofSeconds(30))
+            .interceptors(new LoggingRequestInterceptor())
+            .build();
+    }
+    
+    @Bean
+    public TaskExecutor reconciliationTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("recon-exec-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+}
